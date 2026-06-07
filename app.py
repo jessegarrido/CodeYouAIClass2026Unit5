@@ -805,7 +805,11 @@ def create_context_aware_search_tool(vector_store: VectorStore):
         surrounding context from neighboring document chunks. Use this to
         find information about company policies, benefits, and procedures,
         especially when the answer might span multiple chunks."""
-        results = vector_store.similarity_search_with_score(query, k=3)
+        try:
+            results = vector_store.similarity_search_with_score(query, k=3)
+        except Exception as e:
+            logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
+            return "The document search is temporarily unavailable due to API rate limits. Please try again later."
 
         if not results:
             return "No results found for the given query."
@@ -814,7 +818,6 @@ def create_context_aware_search_tool(vector_store: VectorStore):
         for i, (document, score) in enumerate(results, 1):
             chunk_index = document.metadata.get("chunkIndex")
             file_name = document.metadata.get("fileName", "unknown")
-            chunk_level = document.metadata.get("chunkLevel", "")
 
             # Build the main result entry
             entry_parts = [
@@ -829,13 +832,16 @@ def create_context_aware_search_tool(vector_store: VectorStore):
                 for ni in neighbor_indices:
                     if ni < 1:
                         continue
-                    # InMemoryVectorStore requires a callable filter;
-                    # Chroma accepts a dict, so we use a lambda for compatibility
-                    neighbor_results = vector_store.similarity_search_with_score(
-                        query,
-                        k=5,
-                        filter=lambda doc: doc.metadata.get("chunkIndex") == ni,
-                    )
+                    try:
+                        # InMemoryVectorStore requires a callable filter;
+                        # Chroma accepts a dict, so we use a lambda for compatibility
+                        neighbor_results = vector_store.similarity_search_with_score(
+                            query,
+                            k=5,
+                            filter=lambda doc: doc.metadata.get("chunkIndex") == ni,
+                        )
+                    except Exception:
+                        continue  # skip neighbor if rate limited
                     for neighbor_doc, ns in neighbor_results:
                         n_idx = neighbor_doc.metadata.get("chunkIndex")
                         if n_idx == ni:
@@ -871,7 +877,11 @@ def create_search_tool(vector_store: VectorStore):
         """Searches the company document repository for relevant information
         based on the given query. Use this to find information about company
         policies, benefits, and procedures."""
-        results = vector_store.similarity_search_with_score(query, k=3)
+        try:
+            results = vector_store.similarity_search_with_score(query, k=3)
+        except Exception as e:
+            logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
+            return "The document search is temporarily unavailable due to API rate limits. Please try again later."
 
         if not results:
             return "No results found for the given query."
@@ -967,154 +977,273 @@ def _get_chunks_from_fn(chunk_fn, file_path: str) -> list[Document]:
         return []
 
 
+def _create_chat_model_with_fallback() -> tuple[ChatOpenAI, str]:
+    """Create a chat model, falling back through providers when rate limited.
+
+    Attempts in order:
+    1. **gpt-4o** via GitHub Models (GITHUB_TOKEN)
+    2. **GLM-5** via OpenCode Go (OPENCODE_API_KEY)
+
+    Each candidate is tested with a short query so rate limits are caught
+    immediately (max_retries=0). Falls through to the next on 429 errors.
+
+    Return:
+        A tuple of (chat_model, description_string).
+
+    Raises:
+        SystemExit: If all providers are unavailable.
+    """
+    github_token = os.getenv("GITHUB_TOKEN")
+    opencode_api_key = os.getenv("OPENCODE_API_KEY")
+
+    # ── Attempt 1: gpt-4o via GitHub Models ──────────────────────────────
+    if github_token:
+        logger.info("Attempting chat model: gpt-4o via GitHub Models")
+        print("⏳ Attempting chat model: gpt-4o via GitHub Models...")
+        try:
+            candidate = ChatOpenAI(
+                model="gpt-4o",
+                temperature=0,
+                base_url="https://models.inference.ai.azure.com",
+                api_key=github_token,
+                max_retries=0,
+            )
+            # Quick test to catch rate limits immediately
+            candidate.invoke([HumanMessage(content="ping")])
+            logger.info("gpt-4o via GitHub Models is available.")
+            print("   ✅ gpt-4o via GitHub Models\n")
+            return candidate, "gpt-4o (via GitHub Models, temperature=0)"
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                logger.warning("gpt-4o rate limited — will try fallback")
+                print("   ⚠️  gpt-4o rate limited, trying fallback...\n")
+            else:
+                logger.warning("gpt-4o failed unexpectedly — will try fallback: %s", e)
+                print(f"   ⚠️  gpt-4o failed ({e}), trying fallback...\n")
+    else:
+        logger.info("GITHUB_TOKEN not set — skipping gpt-4o attempt")
+        print("⏩ GITHUB_TOKEN not set — skipping gpt-4o attempt\n")
+
+    # ── Attempt 2: GLM-5 via OpenCode Go ──────────────────────────────────
+    if opencode_api_key:
+        logger.info("Attempting chat model: GLM-5 via OpenCode Go")
+        print("⏳ Attempting chat model: GLM-5 via OpenCode Go...")
+        try:
+            candidate = ChatOpenAI(
+                model="glm-5",
+                temperature=0,
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key=opencode_api_key,
+                max_retries=0,
+            )
+            # Quick test to catch rate limits immediately
+            candidate.invoke([HumanMessage(content="ping")])
+            logger.info("GLM-5 via OpenCode Go is available.")
+            print("   ✅ GLM-5 via OpenCode Go\n")
+            return candidate, "GLM-5 (via OpenCode Go, temperature=0)"
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                logger.warning("OpenCode Go also rate limited")
+                print("   ❌ OpenCode Go also rate limited.\n")
+            else:
+                logger.warning("OpenCode Go failed: %s", e)
+                print(f"   ❌ OpenCode Go failed: {e}\n")
+    else:
+        logger.info("OPENCODE_API_KEY not set — skipping OpenCode Go attempt")
+
+    # ── All providers failed ──────────────────────────────────────────────
+    logger.error("No chat model provider available")
+    print("❌ Error: No chat model provider available.")
+    print("Please ensure at least one of the following is set in your .env file:")
+    print("  - GITHUB_TOKEN (for gpt-4o via GitHub Models)")
+    print("  - OPENCODE_API_KEY (for GLM-5 via OpenCode Go)")
+    raise SystemExit(1)
+
+
 def main() -> None:
     """Run the embedding inspector lab application."""
     logger.info("Python LangChain Agent Starting...")
     print("🤖 Python LangChain Agent Starting...\n")
 
-    # Check for required API tokens
+    # Check for required tokens
     github_token = os.getenv("GITHUB_TOKEN")
     opencode_api_key = os.getenv("OPENCODE_API_KEY")
 
+    # ── Create chat model with fallback ────────────────────────────────────
+    # Tries gpt-4o via GitHub Models first, falls back to GLM-5
+    # via OpenCode Go if rate limited.
+    chat_model, chat_description = _create_chat_model_with_fallback()
+    print(f"🤖 Chat model: {chat_description}\n")
+
+    # ── Embeddings & Vector Store (optional) ───────────────────────────────
+    # If you are being rate-limited on embeddings, you can run in chat-only
+    # mode. The agent will still work — it just won't have a search tool.
+    embeddings: Optional[OpenAIEmbeddings] = None
+    vector_store: Optional[VectorStore] = None
+    embeddings_available = False
+
     if not github_token:
-        logger.error("GITHUB_TOKEN not found in environment variables")
-        print("❌ Error: GITHUB_TOKEN not found in environment variables.")
-        print("This is needed for generating embeddings (text-embedding-3-small).")
-        print("Please create a .env file with your GitHub token:")
-        print("GITHUB_TOKEN=your-github-token-here")
-        print("\nGet your token from: https://github.com/settings/tokens")
-        print("Or use GitHub Models: https://github.com/marketplace/models")
-        return
+        logger.warning("GITHUB_TOKEN not found — skipping vector database setup")
+        print("⚠️  GITHUB_TOKEN not found. Running in chat-only mode (no document search).\n")
+    else:
+        try:
+            embeddings = OpenAIEmbeddings(
+                model="text-embedding-3-small",
+                base_url="https://models.inference.ai.azure.com",
+                api_key=github_token,
+                check_embedding_ctx_length=False,
+                max_retries=0,  # fail fast on rate limits
+            )
 
-    if not opencode_api_key:
-        logger.error("OPENCODE_API_KEY not found in environment variables")
-        print("❌ Error: OPENCODE_API_KEY not found in environment variables.")
-        print("This is needed for the chat model (DeepSeek V4 Flash via OpenCode Go).")
-        print("Please create a .env file with your OpenCode Go API key:")
-        print("OPENCODE_API_KEY=your-opencode-go-api-key")
-        print("\nGet your key from: https://opencode.ai/auth")
-        return
+            # Quick test to see if embeddings API is reachable (not rate limited)
+            logger.info("Testing embedding API connectivity...")
+            embeddings.embed_query("connectivity test")
+            logger.info("Embedding API is available.")
 
-    # Create embeddings instance using GitHub Models API
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        base_url="https://models.inference.ai.azure.com",
-        api_key=github_token,
-        check_embedding_ctx_length=False,
-    )
+            # Allow user to choose persistent vs ephemeral storage backend
+            print("Choose vector store backend:")
+            print("  1. InMemoryVectorStore (default, data lost on exit)")
+            print("  2. Chroma (persistent, data saved to disk)")
+            choice = input("Enter 1 or 2 [1]: ").strip()
 
-    # Allow user to choose persistent vs ephemeral storage backend
-    print("Choose vector store backend:")
-    print("  1. InMemoryVectorStore (default, data lost on exit)")
-    print("  2. Chroma (persistent, data saved to disk)")
-    choice = input("Enter 1 or 2 [1]: ").strip()
+            if choice == "2":
+                vector_store = Chroma(
+                    embedding_function=embeddings,
+                    persist_directory=CHROMA_PERSIST_DIR,
+                    collection_name="lab_sentences",
+                )
+                store_type = "Chroma (persistent)"
+                logger.info("Using Chroma vector store with persist_directory=%s", CHROMA_PERSIST_DIR)
+            else:
+                vector_store = InMemoryVectorStore(embeddings)
+                store_type = "InMemory (ephemeral)"
+                logger.info("Using InMemoryVectorStore")
 
-    if choice == "2":
-        vector_store: VectorStore = Chroma(
-            embedding_function=embeddings,
-            persist_directory=CHROMA_PERSIST_DIR,
-            collection_name="lab_sentences",
+            print(f"📦 Vector store: {store_type}\n")
+            embeddings_available = True
+
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                logger.warning("Embeddings API rate limited — running in chat-only mode")
+                print("⚠️  Embeddings API rate limited. Running in chat-only mode (no document search).\n")
+            else:
+                logger.warning("Failed to set up embeddings/vector store: %s", e)
+                print(f"⚠️  Could not set up vector database: {e}")
+                print("   Running in chat-only mode (no document search).\n")
+
+    # ── Load Documents (only if embeddings available) ──────────────────────
+    if embeddings_available and vector_store is not None:
+        print("=== Loading Documents into Vector Database ===")
+
+        # Map strategy choice to chunking function
+        print("\n--- Chunking Strategy Selection ---")
+        print("Choose how to chunk the Employee Handbook:")
+        print("  1. Markdown-aware chunking (default)")
+        print("  2. Fixed-size chunking")
+        print("  3. Challenge 1: Dynamic chunk sizing")
+        print("  4. Challenge 2: Hierarchical chunking")
+        print("  5. Challenge 4: Smart overlap chunking")
+        strat_choice = input("Enter 1–5 [1]: ").strip()
+
+        print("\n--- Quality Scoring (Challenge 3) ---")
+        score_choice = input("Enable chunk quality scoring? (y/n) [n]: ").strip().lower()
+        enable_scoring = score_choice == "y"
+        if enable_scoring:
+            print("   📊 Quality scoring enabled — chunks scored on completeness, coherence, and size\n")
+
+        print("--- Context-Aware Search (Challenge 5) ---")
+        context_choice = input("Enable cross-chunk context in search results? (y/n) [n]: ").strip().lower()
+        enable_context_search = context_choice == "y"
+        if enable_context_search:
+            print("   🔗 Context-aware enabled — neighboring chunks included in search results\n")
+
+        print()
+        print("=== Loading Documents ===")
+
+        health_doc_id = load_document(vector_store, "HealthInsuranceBrochure.md")
+        if health_doc_id:
+            print(f"📄 Successfully loaded HealthInsuranceBrochure.md (id: {health_doc_id})")
+        else:
+            print("⚠️  Could not load HealthInsuranceBrochure.md")
+
+        if strat_choice == "2":
+            chunk_fn = load_with_fixed_size_chunking
+            strategy_name = "Fixed-size chunking"
+        elif strat_choice == "3":
+            chunk_fn = load_with_dynamic_chunking
+            strategy_name = "Dynamic chunk sizing (Challenge 1)"
+        elif strat_choice == "4":
+            chunk_fn = load_with_hierarchical_chunking
+            strategy_name = "Hierarchical chunking (Challenge 2)"
+        elif strat_choice == "5":
+            chunk_fn = load_with_smart_overlap_chunking
+            strategy_name = "Smart overlap chunking (Challenge 4)"
+        else:
+            chunk_fn = load_with_markdown_chunking
+            strategy_name = "Markdown-aware chunking"
+
+        print(f"   Strategy: {strategy_name}")
+
+        if enable_scoring:
+            employee_chunks = _load_with_scoring_wrapper(chunk_fn, vector_store, "EmployeeHandbook.md")
+            print("   Quality scoring: enabled (Challenge 3)")
+        else:
+            employee_chunks = chunk_fn(vector_store, "EmployeeHandbook.md")
+
+        search_available = (health_doc_id is not None) or (employee_chunks > 0)
+
+        if employee_chunks > 0:
+            print(f"📄 Successfully chunked and loaded EmployeeHandbook.md ({employee_chunks} chunks)")
+        else:
+            print("⚠️  Could not load EmployeeHandbook.md")
+
+        # ── Create Agent with search tool (or fall back to chat-only) ──────
+        if search_available:
+            if enable_context_search:
+                search_tool = create_context_aware_search_tool(vector_store)
+                print("🔗 Using context-aware search tool (Challenge 5)")
+            else:
+                search_tool = create_search_tool(vector_store)
+
+            agent = create_agent(
+                model=chat_model,
+                tools=[search_tool],
+                system_prompt=(
+                    "You are a helpful assistant that answers questions about company "
+                    "policies, benefits, and procedures. Use the search_documents tool "
+                    "to find relevant information before answering. Always cite which "
+                    "document chunks you used in your answer."
+                ),
+            )
+            print("🤖 ReAct agent created with search_documents tool\n")
+        else:
+            # All embeddings failed (likely rate limited) — fall back to chat-only
+            agent = create_agent(
+                model=chat_model,
+                system_prompt=(
+                    "You are a helpful assistant that answers questions about company "
+                    "policies, benefits, and procedures. You don't have access to the "
+                    "company document database right now, so answer based on general "
+                    "knowledge. The documents are temporarily unavailable."
+                ),
+            )
+            print("💬 Embedding API rate limited — falling back to chat-only mode\n")
+
+    else:
+        # ── Create Agent without search tool (chat-only mode) ──────────────
+        agent = create_agent(
+            model=chat_model,
+            system_prompt=(
+                "You are a helpful assistant that answers questions about company "
+                "policies, benefits, and procedures. You don't have access to the "
+                "company document database right now, so answer based on general "
+                "knowledge. The documents are temporarily unavailable."
+            ),
         )
-        store_type = "Chroma (persistent)"
-        logger.info("Using Chroma vector store with persist_directory=%s", CHROMA_PERSIST_DIR)
-    else:
-        vector_store = InMemoryVectorStore(embeddings)
-        store_type = "InMemory (ephemeral)"
-        logger.info("Using InMemoryVectorStore")
-
-    print(f"📦 Vector store: {store_type}\n")
-
-    # Create chat model using OpenCode Go API (OpenAI-compatible)
-    chat_model = ChatOpenAI(
-        model="deepseek-v4-flash",
-        temperature=0,
-        base_url="https://opencode.ai/zen/go/v1",
-        api_key=opencode_api_key,
-    )
-    print("🤖 Chat model: DeepSeek V4 Flash (via OpenCode Go, temperature=0)\n")
-
-    # ── Chunking Strategy Selection ───────────────────────────────────────
-    print("=== Chunking Strategy Selection ===")
-    print("Choose how to chunk the Employee Handbook:")
-    print("  1. Markdown-aware chunking (default)")
-    print("  2. Fixed-size chunking")
-    print("  3. Challenge 1: Dynamic chunk sizing (adaptive chunk sizes)")
-    print("  4. Challenge 2: Hierarchical chunking (parent/child chunks)")
-    print("  5. Challenge 4: Smart overlap chunking (sentence-boundary aware)")
-    strat_choice = input("Enter 1–5 [1]: ").strip()
-
-    # ── Quality Scoring Toggle (Challenge 3) ──────────────────────────────
-    print("\n--- Quality Scoring (Challenge 3) ---")
-    score_choice = input("Enable chunk quality scoring? (y/n) [n]: ").strip().lower()
-    enable_scoring = score_choice == "y"
-    if enable_scoring:
-        print("   📊 Quality scoring enabled — chunks scored on completeness, coherence, and size\n")
-
-    # ── Context-Aware Search Toggle (Challenge 5) ─────────────────────────
-    print("--- Context-Aware Search (Challenge 5) ---")
-    context_choice = input("Enable cross-chunk context in search results? (y/n) [n]: ").strip().lower()
-    enable_context_search = context_choice == "y"
-    if enable_context_search:
-        print("   🔗 Context-aware enabled — neighboring chunks included in search results\n")
-
-    # ── Load Documents ────────────────────────────────────────────────────
-    print("=== Loading Documents into Vector Database ===")
-
-    health_doc_id = load_document(vector_store, "HealthInsuranceBrochure.md")
-    if health_doc_id:
-        print(f"📄 Successfully loaded HealthInsuranceBrochure.md (id: {health_doc_id})")
-    else:
-        print("⚠️  Could not load HealthInsuranceBrochure.md")
-
-    # Map strategy choice to chunking function
-    if strat_choice == "2":
-        chunk_fn = load_with_fixed_size_chunking
-        strategy_name = "Fixed-size chunking"
-    elif strat_choice == "3":
-        chunk_fn = load_with_dynamic_chunking
-        strategy_name = "Dynamic chunk sizing (Challenge 1)"
-    elif strat_choice == "4":
-        chunk_fn = load_with_hierarchical_chunking
-        strategy_name = "Hierarchical chunking (Challenge 2)"
-    elif strat_choice == "5":
-        chunk_fn = load_with_smart_overlap_chunking
-        strategy_name = "Smart overlap chunking (Challenge 4)"
-    else:
-        chunk_fn = load_with_markdown_chunking
-        strategy_name = "Markdown-aware chunking"
-
-    print(f"   Strategy: {strategy_name}")
-
-    if enable_scoring:
-        employee_chunks = _load_with_scoring_wrapper(chunk_fn, vector_store, "EmployeeHandbook.md")
-        print("   Quality scoring: enabled (Challenge 3)")
-    else:
-        employee_chunks = chunk_fn(vector_store, "EmployeeHandbook.md")
-
-    if employee_chunks > 0:
-        print(f"📄 Successfully chunked and loaded EmployeeHandbook.md ({employee_chunks} chunks)")
-    else:
-        print("⚠️  Could not load EmployeeHandbook.md")
-
-    # ── Create Agent ─────────────────────────────────────────────────────
-    if enable_context_search:
-        search_tool = create_context_aware_search_tool(vector_store)
-        print("🔗 Using context-aware search tool (Challenge 5)")
-    else:
-        search_tool = create_search_tool(vector_store)
-
-    agent = create_agent(
-        model=chat_model,
-        tools=[search_tool],
-        system_prompt=(
-            "You are a helpful assistant that answers questions about company "
-            "policies, benefits, and procedures. Use the search_documents tool "
-            "to find relevant information before answering. Always cite which "
-            "document chunks you used in your answer."
-        ),
-    )
-
-    print("🤖 ReAct agent created with search_documents tool\n")
+        print("💬 Chat-only mode — agent created without document search tool\n")
 
     # ── Agent Chat Loop ──────────────────────────────────────────────────
     print("=" * 60)

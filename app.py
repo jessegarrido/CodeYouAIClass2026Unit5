@@ -1,17 +1,17 @@
 import logging
-import math
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import OpenAIEmbeddings
 
-# Type alias for either vector store backend
-VectorStore = InMemoryVectorStore | Chroma
+# Union type for either vector store backend (compatible with Python 3.9+)
+VectorStore = Union[InMemoryVectorStore, Chroma]
 
 # ─── Logging Configuration ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -22,28 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_RESULTS = 3
-SIMILARITY_THRESHOLD = 0.7
-CATEGORIES = ["animals", "science", "food", "sports", "weather", "technology"]
 CHROMA_PERSIST_DIR = "./chroma_db"
-
-# Sentence-to-category mapping for metadata filtering
-SENTENCE_CATEGORIES: dict[str, str] = {
-    "The canine barked loudly.": "animals",
-    "The dog made a noise.": "animals",
-    "The electron spins rapidly.": "science",
-    "I love eating pizza with extra cheese.": "food",
-    "The basketball player scored a three-pointer.": "sports",
-    "Rain is forecasted for tomorrow afternoon.": "weather",
-    "Python is a popular programming language.": "technology",
-    "The kitten purred softly on the couch.": "animals",
-    "Quantum mechanics explains particle behavior.": "science",
-    "Homemade pasta tastes better than store-bought.": "food",
-    "The soccer match ended in a tie.": "sports",
-    "Clouds are forming over the mountains.": "weather",
-    "JavaScript runs in web browsers.": "technology",
-    "Puppies need lots of attention and exercise.": "animals",
-    "Atoms are made of protons, neutrons, and electrons.": "science",
-}
 
 # Load environment variables
 load_dotenv()
@@ -59,7 +38,7 @@ def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
         vector_a: First vector.
         vector_b: Second vector (must be the same length as vector_a).
 
-    Returns:
+    Return:
         Cosine similarity score between -1 and 1.
 
     Raises:
@@ -73,135 +52,70 @@ def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def search_sentences(
+def load_document(
     vector_store: VectorStore,
-    query: str,
-    k: int = MAX_RESULTS,
-    category: Optional[str] = None,
-    threshold: Optional[float] = None,
-) -> list[tuple[str, float]]:
-    """Search for sentences similar to the given query in the vector store.
+    file_path: str,
+) -> Optional[str]:
+    """Load a document from a file and add it to the vector store.
+
+    Reads the full text content of a file, creates a LangChain Document
+    with metadata (fileName and createdAt), and stores it in the vector
+    store for later semantic search.
 
     Args:
-        vector_store: The in-memory vector store to search against.
-        query: The search query string to find similar sentences for.
-        k: Maximum number of results to return. Defaults to MAX_RESULTS.
-        category: Optional category filter to restrict results to a specific
-            category (e.g., "animals", "science").
-        threshold: Optional minimum similarity score. Results below this
-            threshold are excluded. Defaults to None (no filtering).
+        vector_store: The vector store to add the document to.
+        file_path: Path to the file to load.
 
-    Returns:
-        A list of tuples containing (document_text, similarity_score),
-        sorted by descending similarity.
+    Return:
+        The document ID assigned by the vector store, or None if loading
+        failed.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
     """
-    # ── Challenge 1: Metadata Filtering ───────────────────────────────────
-    filter_dict: Optional[dict[str, str]] = None
-    if category:
-        filter_dict = {"category": category}
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        logger.error("File not found: %s", file_path)
+        print(f"❌ Error: File not found: {file_path}")
+        return None
+    except Exception as e:
+        logger.exception("Failed to read file: %s", file_path)
+        print(f"❌ Error: Failed to read file: {file_path}")
+        print(f"   {e}")
+        return None
 
-    results = vector_store.similarity_search_with_score(
-        query, k=k, filter=filter_dict
+    document = Document(
+        page_content=text,
+        metadata={
+            "fileName": os.path.basename(file_path),
+            "createdAt": datetime.now().isoformat(),
+        },
     )
 
-    # ── Challenge 3: Threshold Filtering ──────────────────────────────────
-    matched: list[tuple[str, float]] = []
-    label = f'"{query}"'
-    if category:
-        label += f" [category: {category}]"
-    if threshold is not None:
-        label += f" [threshold: {threshold}]"
+    try:
+        doc_ids = vector_store.add_documents([document])
+    except Exception as e:
+        error_msg = str(e)
+        logger.error("Failed to add document to vector store: %s", error_msg)
+        if "maximum context length" in error_msg or "token" in error_msg:
+            print(f"⚠️  This document is too large to embed as a single chunk.")
+            print("   Token limit exceeded. The embedding model can only process up to 8,191 tokens at once.")
+            print("   Solution: The document needs to be split into smaller chunks.")
+        else:
+            print(f"❌ Error: {error_msg}")
+        return None
 
-    print(f"\n🔍 Search Results for {label}:\n")
-    for rank, (document, score) in enumerate(results, 1):
-        if threshold is not None and score < threshold:
-            print(f"  {rank}. [Score: {score:.4f}] ❌ Below threshold — {document.page_content}")
-            continue
-        print(f"  {rank}. [Score: {score:.4f}] {document.page_content}")
-        matched.append((document.page_content, score))
-
-    if not matched:
-        print("  No results matched the criteria.")
-
-    return matched
-
-
-def hybrid_search(
-    vector_store: VectorStore,
-    query: str,
-    k: int = MAX_RESULTS,
-    category: Optional[str] = None,
-    threshold: Optional[float] = None,
-) -> list[tuple[str, float]]:
-    """Combine vector similarity search with keyword matching.
-
-    Hybrid search boosts results that match both semantically and by
-    keyword, giving higher rank to documents that contain the query words.
-
-    Args:
-        vector_store: The in-memory vector store to search against.
-        query: The search query string.
-        k: Maximum number of results to return. Defaults to MAX_RESULTS.
-        category: Optional category filter for metadata filtering.
-        threshold: Optional minimum similarity score for threshold filtering.
-
-    Returns:
-        A list of tuples containing (document_text, combined_score),
-        sorted by descending combined score.
-    """
-    # ── Challenge 2: Hybrid Search ────────────────────────────────────────
-    filter_dict: Optional[dict[str, str]] = None
-    if category:
-        filter_dict = {"category": category}
-
-    results = vector_store.similarity_search_with_score(
-        query, k=k, filter=filter_dict
+    print(f"✅ Loaded '{os.path.basename(file_path)}' ({len(text):,} characters)")
+    logger.info(
+        "Loaded document: fileName=%s, length=%d, id=%s",
+        os.path.basename(file_path),
+        len(text),
+        doc_ids[0] if doc_ids else "N/A",
     )
 
-    # Keyword matching: check if query words appear in the document
-    query_words = set(query.lower().split())
-    scored: list[tuple[str, float, float, float]] = []
-
-    for document, sim_score in results:
-        doc_words = set(document.page_content.lower().split())
-        # Jaccard similarity for keyword overlap
-        keyword_score = (
-            len(query_words & doc_words) / len(query_words | doc_words)
-            if query_words | doc_words
-            else 0.0
-        )
-        # Combined score: 70% semantic + 30% keyword
-        combined_score = 0.7 * sim_score + 0.3 * keyword_score
-        scored.append((document.page_content, sim_score, keyword_score, combined_score))
-
-    # Sort by combined score descending
-    scored.sort(key=lambda x: x[3], reverse=True)
-
-    label = f'"{query}" (hybrid)'
-    if category:
-        label += f" [category: {category}]"
-    if threshold is not None:
-        label += f" [threshold: {threshold}]"
-
-    print(f"\n🔍 Hybrid Search Results for {label}:\n")
-    matched: list[tuple[str, float]] = []
-    for rank, (text, sim, kw, combined) in enumerate(scored, 1):
-        if threshold is not None and combined < threshold:
-            print(
-                f"  {rank}. [Combined: {combined:.4f} | Semantic: {sim:.4f} | "
-                f"Keyword: {kw:.4f}] ❌ Below threshold — {text}"
-            )
-            continue
-        print(
-            f"  {rank}. [Combined: {combined:.4f} | Semantic: {sim:.4f} | "
-            f"Keyword: {kw:.4f}] {text}"
-        )
-        matched.append((text, combined))
-
-    if not matched:
-        print("  No results matched the criteria.")
-
-    return matched
+    return doc_ids[0] if doc_ids else None
 
 
 def main() -> None:
@@ -227,7 +141,7 @@ def main() -> None:
         check_embedding_ctx_length=False,
     )
 
-    # ── Challenge 4: Choose vector store backend ──────────────────────────
+    # Allow user to choose persistent vs ephemeral storage backend
     print("Choose vector store backend:")
     print("  1. InMemoryVectorStore (default, data lost on exit)")
     print("  2. Chroma (persistent, data saved to disk)")
@@ -248,120 +162,20 @@ def main() -> None:
 
     print(f"📦 Vector store: {store_type}\n")
 
-    # Test sentences for embedding comparison
-    sentences = [
-        "The canine barked loudly.",
-        "The dog made a noise.",
-        "The electron spins rapidly.",
-        "I love eating pizza with extra cheese.",
-        "The basketball player scored a three-pointer.",
-        "Rain is forecasted for tomorrow afternoon.",
-        "Python is a popular programming language.",
-        "The kitten purred softly on the couch.",
-        "Quantum mechanics explains particle behavior.",
-        "Homemade pasta tastes better than store-bought.",
-        "The soccer match ended in a tie.",
-        "Clouds are forming over the mountains.",
-        "JavaScript runs in web browsers.",
-        "Puppies need lots of attention and exercise.",
-        "Atoms are made of protons, neutrons, and electrons.",
-    ]
+    # ── Load Documents ────────────────────────────────────────────────────
+    print("=== Loading Documents into Vector Database ===")
 
-    # Store sentences in the vector database with metadata
-    # ── Challenge 1: Category metadata for filtering ───────────────────────
-    print("=== Vector Store Lab ===")
-    print(f"Storing {len(sentences)} sentences in the vector database...")
+    health_doc_id = load_document(vector_store, "HealthInsuranceBrochure.md")
+    if health_doc_id:
+        print(f"📄 Successfully loaded HealthInsuranceBrochure.md (id: {health_doc_id})")
+    else:
+        print("⚠️  Could not load HealthInsuranceBrochure.md")
 
-    metadatas = [
-        {
-            "created_at": datetime.now().isoformat(),
-            "index": i,
-            "category": SENTENCE_CATEGORIES.get(sentence, "general"),
-        }
-        for i, sentence in enumerate(sentences)
-    ]
-    vector_store.add_texts(texts=sentences, metadatas=metadatas)
-
-    print(f"✅ Successfully stored {len(sentences)} sentences\n")
-    for i, sentence in enumerate(sentences, 1):
-        cat = SENTENCE_CATEGORIES.get(sentence, "general")
-        print(f"  {i}. [{cat}] {sentence}")
-
-    # ── Interactive Search Loop ───────────────────────────────────────────
-    print("\n=== Semantic Search ===")
-    print("Available categories:", ", ".join(CATEGORIES))
-    print("Commands: 'quit' to exit, 'mode' to toggle search mode")
-    print("Options : 'cat <category>' to filter by category")
-    print("          'threshold <value>' to set minimum score")
-    print("          'mode' to toggle between semantic and hybrid search")
-
-    # Search state
-    search_mode = "semantic"  # "semantic" or "hybrid"
-    active_category: Optional[str] = None
-    active_threshold: Optional[float] = None
-
-    while True:
-        prompt = f"\n[{search_mode}] Enter query"
-        if active_category:
-            prompt += f" (cat: {active_category})"
-        if active_threshold is not None:
-            prompt += f" (threshold: {active_threshold})"
-        prompt += " (or 'quit' to exit): "
-        query = input(prompt).strip()
-
-        if query.lower() in ("quit", "exit"):
-            break
-
-        if not query:
-            continue
-
-        # Toggle search mode
-        if query.lower() == "mode":
-            search_mode = "hybrid" if search_mode == "semantic" else "semantic"
-            print(f"🔄 Switched to {search_mode} search mode.")
-            continue
-
-        # Set category filter
-        if query.lower().startswith("cat "):
-            requested_category = query[4:].strip().lower()
-            if requested_category in CATEGORIES:
-                active_category = requested_category
-                print(f"📂 Category filter set to: {active_category}")
-            elif requested_category == "all" or requested_category == "none":
-                active_category = None
-                print("📂 Category filter cleared.")
-            else:
-                print(f"❌ Unknown category '{requested_category}'.")
-                print(f"   Available: {', '.join(CATEGORIES)}")
-            continue
-
-        # Set threshold filter
-        if query.lower().startswith("threshold "):
-            try:
-                active_threshold = float(query[10:].strip())
-                print(f"🎯 Similarity threshold set to: {active_threshold}")
-            except ValueError:
-                print("❌ Invalid threshold value. Use a number like 0.7")
-            continue
-
-        # Perform search
-        if search_mode == "hybrid":
-            hybrid_search(
-                vector_store,
-                query,
-                category=active_category,
-                threshold=active_threshold,
-            )
-        else:
-            search_sentences(
-                vector_store,
-                query,
-                category=active_category,
-                threshold=active_threshold,
-            )
-        print()
-
-    print("\n👋 Goodbye!")
+    employee_doc_id = load_document(vector_store, "EmployeeHandbook.md")
+    if employee_doc_id:
+        print(f"📄 Successfully loaded EmployeeHandbook.md (id: {employee_doc_id})")
+    else:
+        print("⚠️  Could not load EmployeeHandbook.md")
 
 
 if __name__ == "__main__":

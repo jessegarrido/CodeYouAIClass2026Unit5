@@ -8,7 +8,7 @@ A Retrieval-Augmented Generation (RAG) application that loads company documents 
 
 ```bash
 # Navigate to the project directory
-cd /home/jesse/CodeYou/Unit5
+cd CodeYouAIClass2026Unit5
 
 # Create a virtual environment
 python3 -m venv venv

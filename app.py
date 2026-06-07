@@ -4,7 +4,6 @@ import re
 from datetime import datetime
 from typing import Optional, Union
 
-import numpy as np
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_chroma import Chroma
@@ -18,6 +17,7 @@ from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter,
 )
+import numpy as np
 
 # Union type for either vector store backend (compatible with Python 3.9+)
 VectorStore = Union[InMemoryVectorStore, Chroma]
@@ -501,7 +501,10 @@ def load_with_hierarchical_chunking(
             logger.error("Failed to store child chunk %d: %s", index, e)
 
     total = len(parent_indices) + len(raw_child_chunks)
-    print(f"📁 Stored {stored_count}/{total} total chunks ({len(parent_indices)} parents + {len(raw_child_chunks)} children)")
+    print(
+        f"📁 Stored {stored_count}/{total} total chunks "
+        f"({len(parent_indices)} parents + {len(raw_child_chunks)} children)"
+    )
     return stored_count
 
 

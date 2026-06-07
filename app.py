@@ -1065,6 +1065,197 @@ def _create_chat_model_with_fallback() -> tuple[ChatOpenAI, str]:
     raise SystemExit(1)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Keyword Search Fallback (for when embeddings are unavailable)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text into lowercase words for keyword search.
+
+    Splits on non-alphanumeric characters and filters out very short
+    tokens.
+
+    Args:
+        text: The text to tokenize.
+
+    Return:
+        A list of lowercase word tokens.
+    """
+    return [w for w in re.findall(r"[a-zA-Z0-9]+", text.lower()) if len(w) > 1]
+
+
+def _build_bm25_index(chunks: list[Document]) -> dict:
+    """Build a BM25-like inverted index from document chunks.
+
+    Computes term frequencies per document and inverse document
+    frequency for each term, then stores them for fast scoring
+    at query time.
+
+    Args:
+        chunks: The document chunks to index.
+
+    Return:
+        A dict with the index data: chunks, tokenized_chunks,
+        doc_frequencies, and n_docs.
+    """
+    tokenized_chunks = [_tokenize(c.page_content) for c in chunks]
+    n_docs = len(tokenized_chunks)
+    avg_doc_len = sum(len(t) for t in tokenized_chunks) / max(1, n_docs)
+
+    # Document frequency: how many docs each term appears in
+    doc_frequencies: dict[str, int] = {}
+    for tokens in tokenized_chunks:
+        for token in set(tokens):
+            doc_frequencies[token] = doc_frequencies.get(token, 0) + 1
+
+    return {
+        "chunks": chunks,
+        "tokenized_chunks": tokenized_chunks,
+        "doc_frequencies": doc_frequencies,
+        "n_docs": n_docs,
+        "avg_doc_len": avg_doc_len,
+    }
+
+
+def _bm25_score(query_tokens: list[str], doc_tokens: list[str], df: dict, n_docs: int, avg_dl: float) -> float:
+    """Score a single document against a query using BM25-like weighting.
+
+    Uses a simplified BM25 formula with term frequency saturation
+    and inverse document frequency weighting.
+
+    Args:
+        query_tokens: The tokenized query.
+        doc_tokens: The tokenized document.
+        df: Document frequency map (term -> number of docs containing it).
+        n_docs: Total number of documents in the corpus.
+        avg_dl: Average document length across the corpus.
+
+    Return:
+        A relevance score.
+    """
+    import math
+    score = 0.0
+    dl = len(doc_tokens)
+    k1 = 1.5
+    b = 0.75
+
+    for qt in query_tokens:
+        if qt not in df:
+            continue
+        idf = math.log((n_docs - df[qt] + 0.5) / (df[qt] + 0.5) + 1.0)
+        tf = doc_tokens.count(qt)
+        score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / max(1, avg_dl)))
+
+    return score
+
+
+def create_keyword_search_tool(chunks: list[Document]):
+    """Create a LangChain search tool using keyword-based BM25 scoring.
+
+    Builds an offline keyword index from document chunks so the agent
+    can still search documents when the embeddings API is unavailable.
+
+    Args:
+        chunks: The list of Document chunks to search over.
+
+    Return:
+        A LangChain Tool that the agent can invoke with a query string.
+    """
+    index = _build_bm25_index(chunks)
+    chunk_list = index["chunks"]
+    tokenized = index["tokenized_chunks"]
+    df = index["doc_frequencies"]
+    n_docs = index["n_docs"]
+    avg_doc_len = index["avg_doc_len"]
+
+    @tool
+    def search_documents_keyword(query: str) -> str:
+        """Searches the company document repository using keyword matching.
+        Use this to find information about company policies, benefits,
+        and procedures when semantic search is unavailable."""
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            return "No results found for the given query."
+
+        # Score all chunks
+        scored: list[tuple[float, Document]] = []
+        for idx, doc_tokens in enumerate(tokenized):
+            score = _bm25_score(query_tokens, doc_tokens, df, n_docs, avg_doc_len)
+            if score > 0:
+                scored.append((score, chunk_list[idx]))
+
+        # Sort by score descending, return top k
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_k = scored[:3]
+
+        if not top_k:
+            return "No results found for the given query."
+
+        formatted: list[str] = []
+        for i, (score, doc) in enumerate(top_k, 1):
+            formatted.append(
+                f"Result {i} (Keyword Score: {score:.4f}): {doc.page_content}"
+            )
+
+        return "\n\n".join(formatted)
+
+    return search_documents_keyword
+
+
+def _chunk_document_text(file_path: str, strat_choice: str) -> list[Document]:
+    """Split a document into chunks without using any API.
+
+    Pure text operation — reads the file and applies the selected
+    chunking strategy. Used when embeddings are unavailable.
+
+    Args:
+        file_path: Path to the file to chunk.
+        strat_choice: The chunking strategy number ("1"–"5").
+
+    Return:
+        A list of Document chunks.
+    """
+    with open(file_path, encoding="utf-8") as f:
+        text = f.read()
+
+    if strat_choice == "2":
+        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0, separator=" ")
+        return splitter.create_documents([text])
+    elif strat_choice == "3":
+        from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+        md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2")])
+        sections = md_splitter.split_text(text)
+        all_chunks: list[Document] = []
+        for section in sections:
+            density = _estimate_content_density(section.page_content)
+            chunk_size_val = max(1000, min(3000, int(3000 - density * 2000)))
+            chunk_overlap_val = max(50, min(200, int(chunk_size_val * 0.1)))
+            splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size_val, chunk_overlap=chunk_overlap_val)
+            section_chunks = splitter.split_documents([section])
+            for chunk in section_chunks:
+                if "Header 1" in section.metadata:
+                    chunk.metadata["Header 1"] = section.metadata["Header 1"]
+                if "Header 2" in section.metadata:
+                    chunk.metadata["Header 2"] = section.metadata["Header 2"]
+            all_chunks.extend(section_chunks)
+        return all_chunks
+    elif strat_choice == "4":
+        from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+        md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2")])
+        sections = md_splitter.split_text(text)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+        return splitter.split_documents(sections)
+    elif strat_choice == "5":
+        raw_chunks = _split_with_smart_overlap(text, chunk_size=1500, base_overlap=200)
+        return [Document(page_content=c) for c in raw_chunks]
+    else:
+        # Default: markdown-aware
+        from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+        md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2")])
+        md_chunks = md_splitter.split_text(text)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=200)
+        return splitter.split_documents(md_chunks)
+
 def main() -> None:
     """Run the embedding inspector lab application."""
     logger.info("Python LangChain Agent Starting...")
@@ -1223,30 +1414,73 @@ def main() -> None:
             )
             print("🤖 ReAct agent created with search_documents tool\n")
         else:
-            # All embeddings failed (likely rate limited) — fall back to chat-only
+            # All embeddings failed (likely rate limited) — fall back to keyword search
+            print("🔤 Embedding API rate limited — falling back to keyword-based search\n")
+            print("=== Loading Documents for Keyword Search ===")
+            employee_chunks_local = _chunk_document_text("EmployeeHandbook.md", strat_choice)
+            print(f"   Split into {len(employee_chunks_local)} chunks")
+            search_tool = create_keyword_search_tool(employee_chunks_local)
+            print("🔤 Using keyword search tool (no embeddings required)\n")
             agent = create_agent(
                 model=chat_model,
+                tools=[search_tool],
                 system_prompt=(
                     "You are a helpful assistant that answers questions about company "
-                    "policies, benefits, and procedures. You don't have access to the "
-                    "company document database right now, so answer based on general "
-                    "knowledge. The documents are temporarily unavailable."
+                    "policies, benefits, and procedures. Use the search_documents_keyword "
+                    "tool to find relevant information before answering. Always cite which "
+                    "document chunks you used in your answer."
                 ),
             )
-            print("💬 Embedding API rate limited — falling back to chat-only mode\n")
+            print("🤖 ReAct agent created with keyword search tool\n")
 
     else:
-        # ── Create Agent without search tool (chat-only mode) ──────────────
+        # ── Create Agent with keyword search (embeddings unavailable) ─────
+        print("\n--- Chunking Strategy Selection ---")
+        print("(Embeddings unavailable — using keyword-based search instead)")
+        print("Choose how to chunk the Employee Handbook:")
+        print("  1. Markdown-aware chunking (default)")
+        print("  2. Fixed-size chunking")
+        print("  3. Challenge 1: Dynamic chunk sizing")
+        print("  4. Challenge 2: Hierarchical chunking")
+        print("  5. Challenge 4: Smart overlap chunking")
+        strat_choice = input("Enter 1\u20135 [1]: ").strip()
+        print()
+
+        # Load and chunk the health brochure (full text, no embeddings)
+        print("=== Loading Documents for Keyword Search ===")
+        try:
+            with open("HealthInsuranceBrochure.md", encoding="utf-8") as f:
+                health_text = f.read()
+            print(f"   Read HealthInsuranceBrochure.md ({len(health_text):,} characters)")
+        except FileNotFoundError:
+            health_text = ""
+
+        # Chunk the employee handbook
+        employee_chunks_local = _chunk_document_text("EmployeeHandbook.md", strat_choice)
+        print(f"   Split EmployeeHandbook.md into {len(employee_chunks_local)} chunks")
+
+        # Combine all chunks for the keyword index
+        all_keyword_chunks: list[Document] = list(employee_chunks_local)
+        if health_text:
+            all_keyword_chunks.insert(0, Document(
+                page_content=health_text,
+                metadata={"fileName": "HealthInsuranceBrochure.md"},
+            ))
+
+        search_tool = create_keyword_search_tool(all_keyword_chunks)
+        print("🔤 Using keyword search tool (no embeddings required)\n")
+
         agent = create_agent(
             model=chat_model,
+            tools=[search_tool],
             system_prompt=(
                 "You are a helpful assistant that answers questions about company "
-                "policies, benefits, and procedures. You don't have access to the "
-                "company document database right now, so answer based on general "
-                "knowledge. The documents are temporarily unavailable."
+                "policies, benefits, and procedures. Use the search_documents_keyword "
+                "tool to find relevant information before answering. Always cite which "
+                "document chunks you used in your answer."
             ),
         )
-        print("💬 Chat-only mode — agent created without document search tool\n")
+        print("🤖 ReAct agent created with keyword search tool\n")
 
     # ── Agent Chat Loop ──────────────────────────────────────────────────
     print("=" * 60)

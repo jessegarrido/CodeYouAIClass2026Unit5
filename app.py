@@ -2,7 +2,7 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -11,6 +11,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import (
     CharacterTextSplitter,
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_RESULTS = 3
 CHROMA_PERSIST_DIR = "./chroma_db"
+MAX_CHUNK_CHARS = 1000  # max characters per chunk returned by search tools
+MAX_CHAT_HISTORY = 6     # max turns (Human+AI pairs) kept in chat history
 
 # Load environment variables
 load_dotenv()
@@ -784,10 +787,115 @@ def load_with_smart_overlap_chunking(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Runtime Embedding Failover
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    """Check whether an exception indicates an API rate-limit (429) error.
+
+    Inspects the error message and common exception attributes for signs
+    of rate limiting so we can trigger embedding failover.
+
+    Args:
+        error: The exception to inspect.
+
+    Return:
+        True if the error appears to be a rate-limit response.
+    """
+    error_str = str(error).lower()
+    if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+        return True
+    # Some SDKs nest the status code in a .status_code attribute
+    status = getattr(error, "status_code", None)
+    if status == 429:
+        return True
+    return False
+
+
+class SearchState:
+    """Mutable search state that supports runtime embedding failover.
+
+    Holds the active vector store, a standby embedding provider (for
+    failover), and cached document chunks so we can rebuild the index
+    if the primary embedding API becomes rate limited.
+
+    When the primary embedding provider hits a 429 rate-limit error
+    during a search query, the search tool can lazily build a fallback
+    vector store using the standby embeddings and re-load the cached
+    chunks.  Once the failover happens, all subsequent searches use the
+    fallback provider — no need to switch back.
+
+    Attributes:
+        vector_store: The currently active vector store.
+        standby_embeddings: A second embedding provider (e.g. HuggingFace)
+            kept on standby in case the primary is rate limited.
+        standby_source: Human-readable label for the standby provider.
+        cached_chunks: All document chunks that were loaded into the
+            vector store, kept so we can rebuild the index after failover.
+        failed_over: Whether we have already switched to the standby.
+    """
+
+    def __init__(
+        self,
+        vector_store: Any,
+        standby_embeddings: Any = None,
+        standby_source: Optional[str] = None,
+    ) -> None:
+        self.vector_store = vector_store
+        self.standby_embeddings = standby_embeddings
+        self.standby_source = standby_source
+        self.cached_chunks: list[Document] = []
+        self.failed_over = False
+
+    def failover(self) -> Optional[Any]:
+        """Switch to the standby embedding provider.
+
+        Creates a new InMemoryVectorStore with the standby embeddings,
+        re-loads all cached chunks into it, and replaces the active
+        vector store.  Subsequent searches will use the fallback provider.
+
+        Return:
+            The new vector store, or None if failover is not possible
+            (no standby embeddings, no cached chunks, or already failed over).
+        """
+        if self.failed_over:
+            logger.info("Already failed over — using existing fallback vector store")
+            return self.vector_store
+
+        if self.standby_embeddings is None:
+            logger.warning("Cannot failover: no standby embedding provider available")
+            return None
+
+        if not self.cached_chunks:
+            logger.warning("Cannot failover: no cached chunks to rebuild the index")
+            return None
+
+        logger.info("Failing over from primary to standby embeddings (%s)", self.standby_source)
+        print(f"\n   ⚡ Rate limit detected — failing over to {self.standby_source} embeddings\n")
+
+        try:
+            # Build a new vector store with the standby embeddings
+            new_store = InMemoryVectorStore(self.standby_embeddings)
+
+            # Re-load all cached chunks into the new store
+            print(f"   🔄 Rebuilding vector index with {len(self.cached_chunks)} chunks...")
+            new_store.add_documents(self.cached_chunks)
+            print(f"   ✅ Vector index rebuilt with {self.standby_source} embeddings\n")
+
+            self.vector_store = new_store
+            self.failed_over = True
+            return self.vector_store
+        except Exception as e:
+            logger.error("Failed to build fallback vector store: %s", e)
+            print(f"   ❌ Failedover failed: {e}\n")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Extension Challenge 5: Cross-Chunk Context
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def create_context_aware_search_tool(vector_store: VectorStore):
+def create_context_aware_search_tool(search_state: SearchState):
     """Create a LangChain search tool that returns neighboring chunks for context.
 
     When a chunk is ranked highly for a query, this tool also returns the
@@ -795,8 +903,12 @@ def create_context_aware_search_tool(vector_store: VectorStore):
     the agent with surrounding context, helping it answer questions where
     the answer straddles chunk boundaries.
 
+    If the primary embedding provider returns a rate-limit (429) error,
+    the tool will automatically fail over to the standby provider.
+
     Args:
-        vector_store: The vector store to search against.
+        search_state: Mutable search state containing the active vector store
+            and optional standby embedding provider for failover.
 
     Return:
         A LangChain Tool that the agent can invoke with a query string.
@@ -809,10 +921,23 @@ def create_context_aware_search_tool(vector_store: VectorStore):
         find information about company policies, benefits, and procedures,
         especially when the answer might span multiple chunks."""
         try:
-            results = vector_store.similarity_search_with_score(query, k=3)
+            results = search_state.vector_store.similarity_search_with_score(query, k=3)
         except Exception as e:
-            logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
-            return "The document search is temporarily unavailable due to API rate limits. Please try again later."
+            if _is_rate_limit_error(e) and search_state.standby_embeddings is not None:
+                # Primary embedding provider is rate limited — failover
+                logger.warning("Primary embedding API rate limited, attempting failover")
+                fallback_store = search_state.failover()
+                if fallback_store is not None:
+                    try:
+                        results = fallback_store.similarity_search_with_score(query, k=3)
+                    except Exception as fallback_err:
+                        logger.error("Fallback embedding also failed: %s", fallback_err)
+                        return "The document search is temporarily unavailable. Both embedding providers failed."
+                else:
+                    return "The document search is temporarily unavailable due to API rate limits."
+            else:
+                logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
+                return "The document search is temporarily unavailable due to API rate limits. Please try again later."
 
         if not results:
             return "No results found for the given query."
@@ -825,7 +950,7 @@ def create_context_aware_search_tool(vector_store: VectorStore):
             # Build the main result entry
             entry_parts = [
                 f"Result {i} (Score: {score:.4f}, File: {file_name})",
-                f"{document.page_content}",
+                _truncate(f"{document.page_content}"),
             ]
 
             # If this chunk has a known index, try to fetch neighbors
@@ -838,7 +963,7 @@ def create_context_aware_search_tool(vector_store: VectorStore):
                     try:
                         # InMemoryVectorStore requires a callable filter;
                         # Chroma accepts a dict, so we use a lambda for compatibility
-                        neighbor_results = vector_store.similarity_search_with_score(
+                        neighbor_results = search_state.vector_store.similarity_search_with_score(
                             query,
                             k=5,
                             filter=lambda doc: doc.metadata.get("chunkIndex") == ni,
@@ -851,7 +976,7 @@ def create_context_aware_search_tool(vector_store: VectorStore):
                             relation = "previous" if ni < chunk_index else "next"
                             entry_parts.append(
                                 f"  [Context - {relation} chunk (Index {ni}, Score: {ns:.4f})]: "
-                                f"{neighbor_doc.page_content}"
+                                f"{_truncate(neighbor_doc.page_content)}"
                             )
                             break  # only include the best match for this index
 
@@ -862,14 +987,37 @@ def create_context_aware_search_tool(vector_store: VectorStore):
     return search_documents_context
 
 
-def create_search_tool(vector_store: VectorStore):
+def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
+    """Truncate text to max_chars, preserving whole words at the boundary.
+
+    Args:
+        text: The text to truncate.
+        max_chars: Maximum number of characters.
+
+    Return:
+        Truncated text with an ellipsis if shortened.
+    """
+    if len(text) <= max_chars:
+        return text
+    # Cut at the last space before max_chars
+    truncated = text[:max_chars]
+    last_space = truncated.rfind(" ")
+    if last_space > max_chars // 2:
+        truncated = truncated[:last_space]
+    return truncated + "\n\n[...content truncated]"
+
+
+def create_search_tool(search_state: SearchState):
     """Create a LangChain tool for searching the company document repository.
 
     Builds a search tool that an AI agent can use to query the vector store
-    for relevant company policies, benefits, and procedures.
+    for relevant company policies, benefits, and procedures.  If the primary
+    embedding provider returns a rate-limit (429) error, the tool will
+    automatically fail over to the standby embedding provider.
 
     Args:
-        vector_store: The vector store to search against.
+        search_state: Mutable search state containing the active vector store
+            and optional standby embedding provider for failover.
 
     Return:
         A LangChain Tool that the agent can invoke with a query string.
@@ -881,17 +1029,30 @@ def create_search_tool(vector_store: VectorStore):
         based on the given query. Use this to find information about company
         policies, benefits, and procedures."""
         try:
-            results = vector_store.similarity_search_with_score(query, k=3)
+            results = search_state.vector_store.similarity_search_with_score(query, k=3)
         except Exception as e:
-            logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
-            return "The document search is temporarily unavailable due to API rate limits. Please try again later."
+            if _is_rate_limit_error(e) and search_state.standby_embeddings is not None:
+                # Primary embedding provider is rate limited — failover
+                logger.warning("Primary embedding API rate limited, attempting failover")
+                fallback_store = search_state.failover()
+                if fallback_store is not None:
+                    try:
+                        results = fallback_store.similarity_search_with_score(query, k=3)
+                    except Exception as fallback_err:
+                        logger.error("Fallback embedding also failed: %s", fallback_err)
+                        return "The document search is temporarily unavailable. Both embedding providers failed."
+                else:
+                    return "The document search is temporarily unavailable due to API rate limits."
+            else:
+                logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
+                return "The document search is temporarily unavailable due to API rate limits. Please try again later."
 
         if not results:
             return "No results found for the given query."
 
         formatted: list[str] = []
         for i, (document, score) in enumerate(results, 1):
-            formatted.append(f"Result {i} (Score: {score:.4f}): {document.page_content}")
+            formatted.append(f"Result {i} (Score: {score:.4f}): {_truncate(document.page_content)}")
 
         return "\n\n".join(formatted)
 
@@ -1194,7 +1355,7 @@ def create_keyword_search_tool(chunks: list[Document]):
         formatted: list[str] = []
         for i, (score, doc) in enumerate(top_k, 1):
             formatted.append(
-                f"Result {i} (Keyword Score: {score:.4f}): {doc.page_content}"
+                f"Result {i} (Keyword Score: {score:.4f}): {_truncate(doc.page_content)}"
             )
 
         return "\n\n".join(formatted)
@@ -1271,31 +1432,92 @@ def main() -> None:
     chat_model, chat_description = _create_chat_model_with_fallback()
     print(f"🤖 Chat model: {chat_description}\n")
 
-    # ── Embeddings & Vector Store (optional) ───────────────────────────────
-    # If you are being rate-limited on embeddings, you can run in chat-only
-    # mode. The agent will still work — it just won't have a search tool.
-    embeddings: Optional[OpenAIEmbeddings] = None
+    # ── Embeddings & Vector Store — Three-Tier Fallback ────────────────────
+    # Tries in order:
+    #   1. HuggingFace Inference API (HF_TOKEN) — free, 384-dim
+    #   2. OpenAI text-embedding-3-small via GitHub Models (GITHUB_TOKEN)
+    #   3. Keyword search (BM25, offline, no API required)
+    #
+    # If HuggingFace succeeds at startup, OpenAI is kept on standby so the
+    # search tools can fail over at runtime if HuggingFace gets rate limited.
+    github_token = os.getenv("GITHUB_TOKEN")
+    hf_token = os.getenv("HF_TOKEN")
+    embeddings: Any = None
     vector_store: Optional[VectorStore] = None
     embeddings_available = False
+    embedding_source: Optional[str] = None
+    standby_embeddings: Any = None
+    standby_source: Optional[str] = None
 
-    if not github_token:
-        logger.warning("GITHUB_TOKEN not found — skipping vector database setup")
-        print("⚠️  GITHUB_TOKEN not found. Running in chat-only mode (no document search).\n")
-    else:
+    # ── Attempt 1: HuggingFace Inference API ──────────────────────────────
+    if hf_token:
+        logger.info("Attempting embeddings: all-MiniLM-L6-v2 via HuggingFace Inference API")
+        print("⏳ Attempting embeddings: all-MiniLM-L6-v2 via HuggingFace Inference API...")
         try:
-            embeddings = OpenAIEmbeddings(
+            hf_candidate = HuggingFaceEndpointEmbeddings(
+                model="sentence-transformers/all-MiniLM-L6-v2",
+                huggingfacehub_api_token=hf_token,
+            )
+            hf_candidate.embed_query("connectivity test")
+            logger.info("HuggingFace Inference API is available.")
+            print("   ✅ HuggingFace Inference API ready (384-dim)\n")
+            embeddings = hf_candidate
+            embedding_source = "huggingface"
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                logger.warning("HuggingFace embeddings rate limited — trying fallback")
+                print("   ⚠️  HuggingFace embeddings rate limited, trying fallback...\n")
+            else:
+                logger.warning("HuggingFace embeddings failed — trying fallback: %s", e)
+                print(f"   ⚠️  HuggingFace embeddings failed ({e}), trying fallback...\n")
+    else:
+        logger.info("HF_TOKEN not set — skipping HuggingFace embeddings attempt")
+        print("⏩ HF_TOKEN not set — skipping HuggingFace embeddings\n")
+
+    # ── Attempt 2: OpenAI (GitHub Models) ────────────────────────────────
+    # If HuggingFace succeeded, keep OpenAI on standby for runtime failover.
+    # If HuggingFace failed, use OpenAI as the primary embedding provider.
+    if github_token:
+        try:
+            openai_candidate = OpenAIEmbeddings(
                 model="text-embedding-3-small",
                 base_url="https://models.inference.ai.azure.com",
                 api_key=github_token,
                 check_embedding_ctx_length=False,
-                max_retries=0,  # fail fast on rate limits
+                max_retries=0,
             )
+            openai_candidate.embed_query("connectivity test")
 
-            # Quick test to see if embeddings API is reachable (not rate limited)
-            logger.info("Testing embedding API connectivity...")
-            embeddings.embed_query("connectivity test")
-            logger.info("Embedding API is available.")
+            if embeddings is None:
+                # HuggingFace failed — use OpenAI as primary
+                logger.info("OpenAI embeddings via GitHub Models are available (primary).")
+                print("   ✅ OpenAI text-embedding-3-small (via GitHub Models)\n")
+                embeddings = openai_candidate
+                embedding_source = "openai"
+            else:
+                # HuggingFace succeeded — keep OpenAI on standby for runtime failover
+                logger.info("OpenAI embeddings available as standby for runtime failover.")
+                print("   💡 OpenAI text-embedding-3-small available as standby (runtime failover)\n")
+                standby_embeddings = openai_candidate
+                standby_source = "OpenAI (text-embedding-3-small)"
+        except Exception as e:
+            if embeddings is None:
+                # Both failed — will fall back to keyword search
+                logger.warning("OpenAI embeddings failed — will use keyword search: %s", e)
+                print(f"   ⚠️  OpenAI embeddings failed ({e}), falling back to keyword search...\n")
+            else:
+                # HuggingFace works but OpenAI standby is unavailable
+                logger.warning("OpenAI standby unavailable: %s", e)
+                print(f"   ⚠️  OpenAI standby unavailable ({e})\n")
+    elif embeddings is None:
+        logger.info("GITHUB_TOKEN not set — skipping OpenAI embeddings attempt")
+        print("⏩ GITHUB_TOKEN not set — skipping OpenAI embeddings\n")
 
+    # ── Set up vector store (only if we got embeddings) ──────────────────
+    search_state: Optional[SearchState] = None
+    if embeddings is not None:
+        try:
             # Allow user to choose persistent vs ephemeral storage backend
             print("Choose vector store backend:")
             print("  1. InMemoryVectorStore (default, data lost on exit)")
@@ -1318,15 +1540,23 @@ def main() -> None:
             print(f"📦 Vector store: {store_type}\n")
             embeddings_available = True
 
-        except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                logger.warning("Embeddings API rate limited — running in chat-only mode")
-                print("⚠️  Embeddings API rate limited. Running in chat-only mode (no document search).\n")
+            # Create SearchState with standby embeddings for runtime failover
+            search_state = SearchState(
+                vector_store=vector_store,
+                standby_embeddings=standby_embeddings,
+                standby_source=standby_source,
+            )
+            if standby_embeddings is not None:
+                print(f"🔄 Runtime failover available: {standby_source}\n")
             else:
-                logger.warning("Failed to set up embeddings/vector store: %s", e)
-                print(f"⚠️  Could not set up vector database: {e}")
-                print("   Running in chat-only mode (no document search).\n")
+                print("ℹ️  No standby embedding provider — runtime failover not available\n")
+
+        except Exception as e:
+            logger.warning("Failed to set up vector store: %s", e)
+            print(f"⚠️  Could not set up vector store: {e}\n")
+    else:
+        logger.warning("No embedding provider available — will use keyword search")
+        print("⚠️  No embedding provider available. Running in keyword-search mode.\n")
 
     # ── Load Documents (only if embeddings available) ──────────────────────
     if embeddings_available and vector_store is not None:
@@ -1394,13 +1624,43 @@ def main() -> None:
         else:
             print("⚠️  Could not load EmployeeHandbook.md")
 
+        # Cache all loaded documents in SearchState for runtime failover.
+        # If the primary embedding provider hits a rate limit during search,
+        # we can rebuild the vector store with standby embeddings using
+        # these cached chunks.
+        if search_state is not None and search_state.standby_embeddings is not None:
+            try:
+                # Extract documents from the vector store's internal storage.
+                # InMemoryVectorStore.store values are dicts with "id", "text",
+                # "metadata", "vector" keys.  Chroma uses .get() to retrieve.
+                if isinstance(vector_store, InMemoryVectorStore):
+                    for doc_dict in vector_store.store.values():
+                        search_state.cached_chunks.append(
+                            Document(
+                                page_content=doc_dict["text"],
+                                metadata=doc_dict.get("metadata", {}),
+                            )
+                        )
+                elif isinstance(vector_store, Chroma):
+                    chroma_results = vector_store.get(include=["documents", "metadatas"])
+                    for i, doc_content in enumerate(chroma_results["documents"]):
+                        metadata = chroma_results["metadatas"][i] if chroma_results["metadatas"] else {}
+                        search_state.cached_chunks.append(
+                            Document(page_content=doc_content, metadata=metadata)
+                        )
+                logger.info("Cached %d documents for runtime failover", len(search_state.cached_chunks))
+                print(f"   💾 Cached {len(search_state.cached_chunks)} document chunks for runtime failover\n")
+            except Exception as e:
+                logger.warning("Could not cache documents for failover: %s", e)
+                print(f"   ⚠️  Could not cache documents for failover: {e}\n")
+
         # ── Create Agent with search tool (or fall back to chat-only) ──────
         if search_available:
             if enable_context_search:
-                search_tool = create_context_aware_search_tool(vector_store)
+                search_tool = create_context_aware_search_tool(search_state)
                 print("🔗 Using context-aware search tool (Challenge 5)")
             else:
-                search_tool = create_search_tool(vector_store)
+                search_tool = create_search_tool(search_state)
 
             agent = create_agent(
                 model=chat_model,
@@ -1509,9 +1769,11 @@ def main() -> None:
         ai_response = result["messages"][-1].content
         print(f"\nAgent: {ai_response}")
 
-        # Update chat history for context continuity
+        # Update chat history for context continuity (keep last MAX_CHAT_HISTORY turns)
         chat_history.append(HumanMessage(content=user_input))
         chat_history.append(AIMessage(content=ai_response))
+        if len(chat_history) > MAX_CHAT_HISTORY * 2:
+            chat_history = chat_history[-(MAX_CHAT_HISTORY * 2):]
 
 
 if __name__ == "__main__":

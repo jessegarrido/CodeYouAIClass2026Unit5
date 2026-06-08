@@ -787,115 +787,10 @@ def load_with_smart_overlap_chunking(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Runtime Embedding Failover
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _is_rate_limit_error(error: Exception) -> bool:
-    """Check whether an exception indicates an API rate-limit (429) error.
-
-    Inspects the error message and common exception attributes for signs
-    of rate limiting so we can trigger embedding failover.
-
-    Args:
-        error: The exception to inspect.
-
-    Return:
-        True if the error appears to be a rate-limit response.
-    """
-    error_str = str(error).lower()
-    if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-        return True
-    # Some SDKs nest the status code in a .status_code attribute
-    status = getattr(error, "status_code", None)
-    if status == 429:
-        return True
-    return False
-
-
-class SearchState:
-    """Mutable search state that supports runtime embedding failover.
-
-    Holds the active vector store, a standby embedding provider (for
-    failover), and cached document chunks so we can rebuild the index
-    if the primary embedding API becomes rate limited.
-
-    When the primary embedding provider hits a 429 rate-limit error
-    during a search query, the search tool can lazily build a fallback
-    vector store using the standby embeddings and re-load the cached
-    chunks.  Once the failover happens, all subsequent searches use the
-    fallback provider — no need to switch back.
-
-    Attributes:
-        vector_store: The currently active vector store.
-        standby_embeddings: A second embedding provider (e.g. HuggingFace)
-            kept on standby in case the primary is rate limited.
-        standby_source: Human-readable label for the standby provider.
-        cached_chunks: All document chunks that were loaded into the
-            vector store, kept so we can rebuild the index after failover.
-        failed_over: Whether we have already switched to the standby.
-    """
-
-    def __init__(
-        self,
-        vector_store: Any,
-        standby_embeddings: Any = None,
-        standby_source: Optional[str] = None,
-    ) -> None:
-        self.vector_store = vector_store
-        self.standby_embeddings = standby_embeddings
-        self.standby_source = standby_source
-        self.cached_chunks: list[Document] = []
-        self.failed_over = False
-
-    def failover(self) -> Optional[Any]:
-        """Switch to the standby embedding provider.
-
-        Creates a new InMemoryVectorStore with the standby embeddings,
-        re-loads all cached chunks into it, and replaces the active
-        vector store.  Subsequent searches will use the fallback provider.
-
-        Return:
-            The new vector store, or None if failover is not possible
-            (no standby embeddings, no cached chunks, or already failed over).
-        """
-        if self.failed_over:
-            logger.info("Already failed over — using existing fallback vector store")
-            return self.vector_store
-
-        if self.standby_embeddings is None:
-            logger.warning("Cannot failover: no standby embedding provider available")
-            return None
-
-        if not self.cached_chunks:
-            logger.warning("Cannot failover: no cached chunks to rebuild the index")
-            return None
-
-        logger.info("Failing over from primary to standby embeddings (%s)", self.standby_source)
-        print(f"\n   ⚡ Rate limit detected — failing over to {self.standby_source} embeddings\n")
-
-        try:
-            # Build a new vector store with the standby embeddings
-            new_store = InMemoryVectorStore(self.standby_embeddings)
-
-            # Re-load all cached chunks into the new store
-            print(f"   🔄 Rebuilding vector index with {len(self.cached_chunks)} chunks...")
-            new_store.add_documents(self.cached_chunks)
-            print(f"   ✅ Vector index rebuilt with {self.standby_source} embeddings\n")
-
-            self.vector_store = new_store
-            self.failed_over = True
-            return self.vector_store
-        except Exception as e:
-            logger.error("Failed to build fallback vector store: %s", e)
-            print(f"   ❌ Failedover failed: {e}\n")
-            return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Extension Challenge 5: Cross-Chunk Context
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def create_context_aware_search_tool(search_state: SearchState):
+def create_context_aware_search_tool(vector_store: VectorStore):
     """Create a LangChain search tool that returns neighboring chunks for context.
 
     When a chunk is ranked highly for a query, this tool also returns the
@@ -903,12 +798,8 @@ def create_context_aware_search_tool(search_state: SearchState):
     the agent with surrounding context, helping it answer questions where
     the answer straddles chunk boundaries.
 
-    If the primary embedding provider returns a rate-limit (429) error,
-    the tool will automatically fail over to the standby provider.
-
     Args:
-        search_state: Mutable search state containing the active vector store
-            and optional standby embedding provider for failover.
+        vector_store: The vector store to search against.
 
     Return:
         A LangChain Tool that the agent can invoke with a query string.
@@ -920,24 +811,7 @@ def create_context_aware_search_tool(search_state: SearchState):
         surrounding context from neighboring document chunks. Use this to
         find information about company policies, benefits, and procedures,
         especially when the answer might span multiple chunks."""
-        try:
-            results = search_state.vector_store.similarity_search_with_score(query, k=3)
-        except Exception as e:
-            if _is_rate_limit_error(e) and search_state.standby_embeddings is not None:
-                # Primary embedding provider is rate limited — failover
-                logger.warning("Primary embedding API rate limited, attempting failover")
-                fallback_store = search_state.failover()
-                if fallback_store is not None:
-                    try:
-                        results = fallback_store.similarity_search_with_score(query, k=3)
-                    except Exception as fallback_err:
-                        logger.error("Fallback embedding also failed: %s", fallback_err)
-                        return "The document search is temporarily unavailable. Both embedding providers failed."
-                else:
-                    return "The document search is temporarily unavailable due to API rate limits."
-            else:
-                logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
-                return "The document search is temporarily unavailable due to API rate limits. Please try again later."
+        results = vector_store.similarity_search_with_score(query, k=3)
 
         if not results:
             return "No results found for the given query."
@@ -963,13 +837,13 @@ def create_context_aware_search_tool(search_state: SearchState):
                     try:
                         # InMemoryVectorStore requires a callable filter;
                         # Chroma accepts a dict, so we use a lambda for compatibility
-                        neighbor_results = search_state.vector_store.similarity_search_with_score(
+                        neighbor_results = vector_store.similarity_search_with_score(
                             query,
                             k=5,
                             filter=lambda doc: doc.metadata.get("chunkIndex") == ni,
                         )
                     except Exception:
-                        continue  # skip neighbor if rate limited
+                        continue  # skip neighbor if lookup fails
                     for neighbor_doc, ns in neighbor_results:
                         n_idx = neighbor_doc.metadata.get("chunkIndex")
                         if n_idx == ni:
@@ -1007,17 +881,14 @@ def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
     return truncated + "\n\n[...content truncated]"
 
 
-def create_search_tool(search_state: SearchState):
+def create_search_tool(vector_store: VectorStore):
     """Create a LangChain tool for searching the company document repository.
 
     Builds a search tool that an AI agent can use to query the vector store
-    for relevant company policies, benefits, and procedures.  If the primary
-    embedding provider returns a rate-limit (429) error, the tool will
-    automatically fail over to the standby embedding provider.
+    for relevant company policies, benefits, and procedures.
 
     Args:
-        search_state: Mutable search state containing the active vector store
-            and optional standby embedding provider for failover.
+        vector_store: The vector store to search against.
 
     Return:
         A LangChain Tool that the agent can invoke with a query string.
@@ -1028,24 +899,7 @@ def create_search_tool(search_state: SearchState):
         """Searches the company document repository for relevant information
         based on the given query. Use this to find information about company
         policies, benefits, and procedures."""
-        try:
-            results = search_state.vector_store.similarity_search_with_score(query, k=3)
-        except Exception as e:
-            if _is_rate_limit_error(e) and search_state.standby_embeddings is not None:
-                # Primary embedding provider is rate limited — failover
-                logger.warning("Primary embedding API rate limited, attempting failover")
-                fallback_store = search_state.failover()
-                if fallback_store is not None:
-                    try:
-                        results = fallback_store.similarity_search_with_score(query, k=3)
-                    except Exception as fallback_err:
-                        logger.error("Fallback embedding also failed: %s", fallback_err)
-                        return "The document search is temporarily unavailable. Both embedding providers failed."
-                else:
-                    return "The document search is temporarily unavailable due to API rate limits."
-            else:
-                logger.warning("Search tool failed (embedding API may be rate limited): %s", e)
-                return "The document search is temporarily unavailable due to API rate limits. Please try again later."
+        results = vector_store.similarity_search_with_score(query, k=3)
 
         if not results:
             return "No results found for the given query."
@@ -1437,17 +1291,12 @@ def main() -> None:
     #   1. HuggingFace Inference API (HF_TOKEN) — free, 384-dim
     #   2. OpenAI text-embedding-3-small via GitHub Models (GITHUB_TOKEN)
     #   3. Keyword search (BM25, offline, no API required)
-    #
-    # If HuggingFace succeeds at startup, OpenAI is kept on standby so the
-    # search tools can fail over at runtime if HuggingFace gets rate limited.
     github_token = os.getenv("GITHUB_TOKEN")
     hf_token = os.getenv("HF_TOKEN")
     embeddings: Any = None
     vector_store: Optional[VectorStore] = None
     embeddings_available = False
     embedding_source: Optional[str] = None
-    standby_embeddings: Any = None
-    standby_source: Optional[str] = None
 
     # ── Attempt 1: HuggingFace Inference API ──────────────────────────────
     if hf_token:
@@ -1476,9 +1325,8 @@ def main() -> None:
         print("⏩ HF_TOKEN not set — skipping HuggingFace embeddings\n")
 
     # ── Attempt 2: OpenAI (GitHub Models) ────────────────────────────────
-    # If HuggingFace succeeded, keep OpenAI on standby for runtime failover.
-    # If HuggingFace failed, use OpenAI as the primary embedding provider.
-    if github_token:
+    # Only used if HuggingFace failed or is unavailable.
+    if embeddings is None and github_token:
         try:
             openai_candidate = OpenAIEmbeddings(
                 model="text-embedding-3-small",
@@ -1488,34 +1336,18 @@ def main() -> None:
                 max_retries=0,
             )
             openai_candidate.embed_query("connectivity test")
-
-            if embeddings is None:
-                # HuggingFace failed — use OpenAI as primary
-                logger.info("OpenAI embeddings via GitHub Models are available (primary).")
-                print("   ✅ OpenAI text-embedding-3-small (via GitHub Models)\n")
-                embeddings = openai_candidate
-                embedding_source = "openai"
-            else:
-                # HuggingFace succeeded — keep OpenAI on standby for runtime failover
-                logger.info("OpenAI embeddings available as standby for runtime failover.")
-                print("   💡 OpenAI text-embedding-3-small available as standby (runtime failover)\n")
-                standby_embeddings = openai_candidate
-                standby_source = "OpenAI (text-embedding-3-small)"
+            logger.info("OpenAI embeddings via GitHub Models are available (primary).")
+            print("   ✅ OpenAI text-embedding-3-small (via GitHub Models)\n")
+            embeddings = openai_candidate
+            embedding_source = "openai"
         except Exception as e:
-            if embeddings is None:
-                # Both failed — will fall back to keyword search
-                logger.warning("OpenAI embeddings failed — will use keyword search: %s", e)
-                print(f"   ⚠️  OpenAI embeddings failed ({e}), falling back to keyword search...\n")
-            else:
-                # HuggingFace works but OpenAI standby is unavailable
-                logger.warning("OpenAI standby unavailable: %s", e)
-                print(f"   ⚠️  OpenAI standby unavailable ({e})\n")
+            logger.warning("OpenAI embeddings failed — will use keyword search: %s", e)
+            print(f"   ⚠️  OpenAI embeddings failed ({e}), falling back to keyword search...\n")
     elif embeddings is None:
         logger.info("GITHUB_TOKEN not set — skipping OpenAI embeddings attempt")
         print("⏩ GITHUB_TOKEN not set — skipping OpenAI embeddings\n")
 
     # ── Set up vector store (only if we got embeddings) ──────────────────
-    search_state: Optional[SearchState] = None
     if embeddings is not None:
         try:
             # Allow user to choose persistent vs ephemeral storage backend
@@ -1539,17 +1371,6 @@ def main() -> None:
 
             print(f"📦 Vector store: {store_type}\n")
             embeddings_available = True
-
-            # Create SearchState with standby embeddings for runtime failover
-            search_state = SearchState(
-                vector_store=vector_store,
-                standby_embeddings=standby_embeddings,
-                standby_source=standby_source,
-            )
-            if standby_embeddings is not None:
-                print(f"🔄 Runtime failover available: {standby_source}\n")
-            else:
-                print("ℹ️  No standby embedding provider — runtime failover not available\n")
 
         except Exception as e:
             logger.warning("Failed to set up vector store: %s", e)
@@ -1624,43 +1445,13 @@ def main() -> None:
         else:
             print("⚠️  Could not load EmployeeHandbook.md")
 
-        # Cache all loaded documents in SearchState for runtime failover.
-        # If the primary embedding provider hits a rate limit during search,
-        # we can rebuild the vector store with standby embeddings using
-        # these cached chunks.
-        if search_state is not None and search_state.standby_embeddings is not None:
-            try:
-                # Extract documents from the vector store's internal storage.
-                # InMemoryVectorStore.store values are dicts with "id", "text",
-                # "metadata", "vector" keys.  Chroma uses .get() to retrieve.
-                if isinstance(vector_store, InMemoryVectorStore):
-                    for doc_dict in vector_store.store.values():
-                        search_state.cached_chunks.append(
-                            Document(
-                                page_content=doc_dict["text"],
-                                metadata=doc_dict.get("metadata", {}),
-                            )
-                        )
-                elif isinstance(vector_store, Chroma):
-                    chroma_results = vector_store.get(include=["documents", "metadatas"])
-                    for i, doc_content in enumerate(chroma_results["documents"]):
-                        metadata = chroma_results["metadatas"][i] if chroma_results["metadatas"] else {}
-                        search_state.cached_chunks.append(
-                            Document(page_content=doc_content, metadata=metadata)
-                        )
-                logger.info("Cached %d documents for runtime failover", len(search_state.cached_chunks))
-                print(f"   💾 Cached {len(search_state.cached_chunks)} document chunks for runtime failover\n")
-            except Exception as e:
-                logger.warning("Could not cache documents for failover: %s", e)
-                print(f"   ⚠️  Could not cache documents for failover: {e}\n")
-
         # ── Create Agent with search tool (or fall back to chat-only) ──────
         if search_available:
             if enable_context_search:
-                search_tool = create_context_aware_search_tool(search_state)
+                search_tool = create_context_aware_search_tool(vector_store)
                 print("🔗 Using context-aware search tool (Challenge 5)")
             else:
-                search_tool = create_search_tool(search_state)
+                search_tool = create_search_tool(vector_store)
 
             agent = create_agent(
                 model=chat_model,

@@ -43,11 +43,11 @@ HF_TOKEN=hf_your_huggingface_token_here
 
 | Variable | Required? | Purpose | How to get |
 |---|---|---|---|
-| `GITHUB_TOKEN` | Recommended | Chat model (gpt-4o) + Standby embeddings | [GitHub Models](https://github.com/settings/tokens) |
+| `GITHUB_TOKEN` | Recommended | Chat model (gpt-4o) + Fallback embeddings | [GitHub Models](https://github.com/settings/tokens) |
 | `OPENCODE_API_KEY` | Optional | Fallback chat model (GLM-5) | [OpenCode Go](https://opencode.ai/auth) (subscription required) |
 | `HF_TOKEN` | Recommended | Primary embeddings (HuggingFace Inference API) | [HuggingFace Settings](https://huggingface.co/settings/tokens) (free) |
 
-> **Note:** At least one of `GITHUB_TOKEN` or `OPENCODE_API_KEY` is required for the chat model to work. `HF_TOKEN` enables primary semantic search via HuggingFace; `GITHUB_TOKEN` enables standby embeddings for runtime failover; without either, the app falls back to keyword search.
+> **Note:** At least one of `GITHUB_TOKEN` or `OPENCODE_API_KEY` is required for the chat model to work. `HF_TOKEN` enables semantic search via HuggingFace; `GITHUB_TOKEN` enables fallback semantic search via OpenAI; without either, the app falls back to keyword search.
 
 ### 4. Run the App
 
@@ -98,31 +98,6 @@ The app starts with the best available option and only falls through to the next
 - `✅ OpenAI text-embedding-3-small (via GitHub Models)` — fallback semantic search
 - `⚠️ No embedding provider available. Running in keyword-search mode.` — BM25 keyword fallback
 
-### Runtime Rate-Limit Failover
-
-If both HuggingFace and OpenAI are available, the app keeps the second provider on **standby**. When the primary embedding provider hits a rate limit (HTTP 429) during a search query, the app automatically:
-
-1. Detects the 429 error from the embedding API
-2. Rebuilds the entire vector index using the standby embeddings
-3. Re-runs the search query on the new index
-4. Uses the standby provider for all subsequent searches
-
-```
-Startup:  HuggingFace (primary) + OpenAI (standby)
-                │
-                ▼  429 rate limit during search
-           ┌────────────────────────────────────┐
-           │  ⚡ Automatic failover triggered     │
-           │  🔄 Rebuild vector index with OpenAI │
-           │  ✅ Resume search on new index        │
-           └────────────────────────────────────┘
-                │
-                ▼
-           OpenAI (now primary, no switch-back)
-```
-
-This means users won't see an error — the search seamlessly continues on the backup provider.
-
 ## Features
 
 - **AI Chat Interface** — Ask questions about company policies, benefits, and procedures
@@ -134,7 +109,6 @@ This means users won't see an error — the search seamlessly continues on the b
   - Smart overlap — sentence-boundary-aware overlap only where needed
 - **Quality Scoring** — Optional evaluation of chunk completeness, coherence, and size
 - **Context-Aware Search** — Returns neighboring chunks alongside search results
-- **Runtime Failover** — Automatically switches to standby embeddings when the primary provider is rate limited
 - **Persistent Storage** — Optional ChromaDB backend for vector data persistence
 
 ## Project Structure

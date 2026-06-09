@@ -22,13 +22,6 @@ source venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
-
-Or if you have [uv](https://docs.astral.sh/uv/) installed:
-
-```bash
-uv pip install -r requirements.txt
-```
-
 ### 3. Set Up API Keys
 
 Create a `.env` file in the project root with the following variables:

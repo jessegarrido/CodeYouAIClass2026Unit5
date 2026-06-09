@@ -1000,7 +1000,7 @@ def _create_chat_model_with_fallback() -> tuple[ChatOpenAI, str]:
 
     Attempts in order:
     1. **gpt-4o** via GitHub Models (GITHUB_TOKEN)
-    2. **GLM-5** via OpenCode Go (OPENCODE_API_KEY)
+    2. **GLM-5.1** via OpenCode Go (OPENCODE_API_KEY)
 
     Each candidate is tested with a short query so rate limits are caught
     immediately (max_retries=0). Falls through to the next on 429 errors.
@@ -1043,13 +1043,13 @@ def _create_chat_model_with_fallback() -> tuple[ChatOpenAI, str]:
         logger.info("GITHUB_TOKEN not set — skipping gpt-4o attempt")
         print("⏩ GITHUB_TOKEN not set — skipping gpt-4o attempt\n")
 
-    # ── Attempt 2: GLM-5 via OpenCode Go ──────────────────────────────────
+    # ── Attempt 2: GLM-5.1 via OpenCode Go ──────────────────────────────────
     if opencode_api_key:
-        logger.info("Attempting chat model: GLM-5 via OpenCode Go")
-        print("⏳ Attempting chat model: GLM-5 via OpenCode Go...")
+        logger.info("Attempting chat model: GLM-5.1 via OpenCode Go")
+        print("⏳ Attempting chat model: GLM-5.1 via OpenCode Go...")
         try:
             candidate = ChatOpenAI(
-                model="glm-5",
+                model="glm-5.1",
                 temperature=0,
                 base_url="https://opencode.ai/zen/go/v1",
                 api_key=opencode_api_key,
@@ -1057,9 +1057,9 @@ def _create_chat_model_with_fallback() -> tuple[ChatOpenAI, str]:
             )
             # Quick test to catch rate limits immediately
             candidate.invoke([HumanMessage(content="ping")])
-            logger.info("GLM-5 via OpenCode Go is available.")
-            print("   ✅ GLM-5 via OpenCode Go\n")
-            return candidate, "GLM-5 (via OpenCode Go, temperature=0)"
+            logger.info("GLM-5.1 via OpenCode Go is available.")
+            print("   ✅ GLM-5.1 via OpenCode Go\n")
+            return candidate, "GLM-5.1 (via OpenCode Go, temperature=0)"
         except Exception as e:
             error_str = str(e).lower()
             if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
@@ -1076,7 +1076,7 @@ def _create_chat_model_with_fallback() -> tuple[ChatOpenAI, str]:
     print("❌ Error: No chat model provider available.")
     print("Please ensure at least one of the following is set in your .env file:")
     print("  - GITHUB_TOKEN (for gpt-4o via GitHub Models)")
-    print("  - OPENCODE_API_KEY (for GLM-5 via OpenCode Go)")
+    print("  - OPENCODE_API_KEY (for GLM-5.1 via OpenCode Go)")
     raise SystemExit(1)
 
 
@@ -1281,7 +1281,7 @@ def main() -> None:
     opencode_api_key = os.getenv("OPENCODE_API_KEY")
 
     # ── Create chat model with fallback ────────────────────────────────────
-    # Tries gpt-4o via GitHub Models first, falls back to GLM-5
+    # Tries gpt-4o via GitHub Models first, falls back to GLM-5.1
     # via OpenCode Go if rate limited.
     chat_model, chat_description = _create_chat_model_with_fallback()
     print(f"🤖 Chat model: {chat_description}\n")
